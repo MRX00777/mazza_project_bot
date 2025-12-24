@@ -30,17 +30,15 @@ function getThreadForClient($chatId, $groupTitle) {
     global $staffGroupId, $topicsFile;
     $topics = json_decode(file_get_contents($topicsFile), true);
 
-    // Если для этого чата (группы) уже есть топик
     if (isset($topics["c_$chatId"])) return $topics["c_$chatId"];
 
-    // Создаем топик с названием группы клиента
     $topicName = "📂 " . $groupTitle;
     $res = tgRequest("createForumTopic", ["chat_id" => $staffGroupId, "name" => $topicName]);
     
     if (isset($res["result"]["message_thread_id"])) {
         $threadId = $res["result"]["message_thread_id"];
-        $topics["c_$chatId"] = $threadId;      // Чат клиента -> Топик
-        $topics["t_$threadId"] = $chatId;      // Топик -> Чат клиента
+        $topics["c_$chatId"] = $threadId;
+        $topics["t_$threadId"] = $chatId;
         file_put_contents($topicsFile, json_encode($topics, JSON_PRETTY_PRINT));
         return $threadId;
     }
@@ -53,6 +51,19 @@ function getClientIdByThread($threadId) {
     return $topics["t_$threadId"] ?? null;
 }
 
+// ====== ПОИСК СООТВЕТСТВИЯ REPLY ======
+function getStaffMsgIdByClientMsgId($clientMsgId) {
+    global $dbFile;
+    $db = json_decode(file_get_contents($dbFile), true);
+    // Ищем в базе сообщение, которое было создано в группе сотрудников для этого сообщения клиента
+    foreach ($db as $staffId => $data) {
+        if ($data['client_message_id'] == $clientMsgId) {
+            return $staffId;
+        }
+    }
+    return null;
+}
+
 // ====== ПОЛУЧЕНИЕ ОБНОВЛЕНИЯ ======
 $update = json_decode(file_get_contents("php://input"), true);
 if (!$update || !isset($update["message"])) exit;
@@ -62,23 +73,20 @@ $chatId = $msg["chat"]["id"];
 $msgId  = $msg["message_id"];
 $userId = $msg["from"]["id"];
 
-// Определяем имя группы (или "Личное", если это ЛС)
 $groupTitle = $msg["chat"]["title"] ?? "Личное (".$msg["from"]["first_name"].")";
-
-// Определяем имя конкретного человека
 $firstName = $msg["from"]["first_name"] ?? "";
 $lastName = $msg["from"]["last_name"] ?? "";
 $senderName = trim($firstName . " " . $lastName);
 if (empty($senderName)) $senderName = "User_$userId";
 
 // ====================
-// ВХОДЯЩЕЕ ОТ СОТРУДНИКА (Группа сотрудников -> Клиентская группа)
+// ВХОДЯЩЕЕ ОТ СОТРУДНИКА
 // ====================
 if ($chatId == $staffGroupId) {
     if (!in_array($userId, $allowedStaff)) exit;
 
     $targetClientId = null;
-    $replyToMsgId = null;
+    $replyToClientMsgId = null;
     $currentThreadId = $msg["message_thread_id"] ?? null;
 
     if (isset($msg["reply_to_message"])) {
@@ -86,7 +94,7 @@ if ($chatId == $staffGroupId) {
         $map = $db[$msg["reply_to_message"]["message_id"]] ?? null;
         if ($map) {
             $targetClientId = $map["client_chat_id"];
-            $replyToMsgId = $map["client_message_id"];
+            $replyToClientMsgId = $map["client_message_id"];
         }
     }
     
@@ -97,7 +105,7 @@ if ($chatId == $staffGroupId) {
     if ($targetClientId) {
         $method = "sendMessage";
         $params = ["chat_id" => $targetClientId];
-        if ($replyToMsgId) $params["reply_to_message_id"] = $replyToMsgId;
+        if ($replyToClientMsgId) $params["reply_to_message_id"] = $replyToClientMsgId;
 
         if (isset($msg["text"])) {
             $params["text"] = "👨‍💼 *Поддержка:*\n\n" . $msg["text"];
@@ -118,22 +126,15 @@ if ($chatId == $staffGroupId) {
         }
 
         $result = tgRequest($method, $params);
-
         if (!$result || (isset($result["ok"]) && !$result["ok"])) {
-            $error = $result["description"] ?? "Ошибка";
-            tgRequest("sendMessage", [
-                "chat_id" => $staffGroupId,
-                "message_thread_id" => $currentThreadId,
-                "text" => "⚠️ *Не доставлено:* $error",
-                "parse_mode" => "Markdown"
-            ]);
+            tgRequest("sendMessage", ["chat_id" => $staffGroupId, "message_thread_id" => $currentThreadId, "text" => "⚠️ Ошибка доставки"]);
         }
     }
     exit;
 }
 
 // ====================
-// ВХОДЯЩЕЕ ОТ КЛИЕНТА (Группа клиента -> Группа сотрудников)
+// ВХОДЯЩЕЕ ОТ КЛИЕНТА
 // ====================
 $threadId = getThreadForClient($chatId, $groupTitle);
 
@@ -145,7 +146,15 @@ if ($threadId) {
         "parse_mode" => "Markdown"
     ];
 
-    // Формируем заголовок: [Имя пользователя]
+    // ПРОВЕРКА НА REPLY СО СТОРОНЫ КЛИЕНТА
+    if (isset($msg["reply_to_message"])) {
+        $originalClientMsgId = $msg["reply_to_message"]["message_id"];
+        $correspondingStaffMsgId = getStaffMsgIdByClientMsgId($originalClientMsgId);
+        if ($correspondingStaffMsgId) {
+            $params["reply_to_message_id"] = $correspondingStaffMsgId;
+        }
+    }
+
     $prefix = "👤 *{$senderName}:*\n";
 
     if (isset($msg["text"])) {
@@ -163,13 +172,14 @@ if ($threadId) {
         $params["document"] = $msg["document"]["file_id"];
         $params["caption"] = $prefix;
     } else {
-        // Если тип сообщения сложный, просто копируем
-        $sent = tgRequest("copyMessage", [
+        $copyParams = [
             "chat_id" => $staffGroupId,
             "from_chat_id" => $chatId,
             "message_id" => $msgId,
             "message_thread_id" => $threadId
-        ]);
+        ];
+        if (isset($params["reply_to_message_id"])) $copyParams["reply_to_message_id"] = $params["reply_to_message_id"];
+        $sent = tgRequest("copyMessage", $copyParams);
         $resId = $sent["result"]["message_id"] ?? null;
     }
 
@@ -184,7 +194,7 @@ if ($threadId) {
             "client_chat_id" => $chatId,
             "client_message_id" => $msgId
         ];
-        if (count($db) > 2000) $db = array_slice($db, -2000, null, true);
+        if (count($db) > 3000) $db = array_slice($db, -3000, null, true);
         file_put_contents($dbFile, json_encode($db, JSON_PRETTY_PRINT));
     }
 }
