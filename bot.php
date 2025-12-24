@@ -7,7 +7,7 @@ $allowedStaff = [1062756366];
 
 $apiUrl = "https://api.telegram.org/bot$botToken/";
 
-// ====== ФАЙЛЫ ======
+// ====== ФАЙЛЫ БД ======
 $dbFile = __DIR__ . "/messages.json";
 $topicsFile = __DIR__ . "/topics.json";
 
@@ -22,155 +22,169 @@ function tgRequest($method, $params = []) {
     curl_setopt($ch, CURLOPT_POSTFIELDS, $params);
     $response = curl_exec($ch);
     curl_close($ch);
-    $result = json_decode($response, true);
-    if (!$result || !isset($result["ok"])) {
-        file_put_contents(__DIR__."/log.txt", date("Y-m-d H:i:s")." Telegram error: ".$response."\n", FILE_APPEND);
-    }
-    return $result;
+    return json_decode($response, true);
 }
 
-// ====== КЕШИРОВАНИЕ ТЕМ ======
-function getOrCreateTopic($groupId, $topicName) {
-    global $topicsFile;
+// ====== РАБОТА С ТОПИКАМИ ======
+function getThreadForClient($chatId, $groupTitle) {
+    global $staffGroupId, $topicsFile;
     $topics = json_decode(file_get_contents($topicsFile), true);
-    if (isset($topics[$topicName])) return $topics[$topicName];
 
-    $res = tgRequest("getForumTopicList", ["chat_id" => $groupId]);
-    if ($res && isset($res["result"]["topics"])) {
-        foreach ($res["result"]["topics"] as $t) {
-            if (mb_strtolower($t["name"]) === mb_strtolower($topicName)) {
-                $threadId = $t["message_thread_id"];
-                $topics[$topicName] = $threadId;
-                file_put_contents($topicsFile, json_encode($topics, JSON_PRETTY_PRINT));
-                return $threadId;
-            }
-        }
-    }
+    // Если для этого чата (группы) уже есть топик
+    if (isset($topics["c_$chatId"])) return $topics["c_$chatId"];
 
-    $res = tgRequest("createForumTopic", ["chat_id" => $groupId, "name" => $topicName]);
-    if (!$res || !isset($res["result"]["message_thread_id"])) {
-        file_put_contents(__DIR__."/log.txt", date("Y-m-d H:i:s")." ERROR: cannot create topic $topicName\n", FILE_APPEND);
-        return null;
-    }
-
-    $threadId = $res["result"]["message_thread_id"];
-    $topics[$topicName] = $threadId;
-    file_put_contents($topicsFile, json_encode($topics, JSON_PRETTY_PRINT));
-    return $threadId;
-}
-
-// ====== МАППИНГ ======
-function saveMapping($staffMsgId, $clientChatId, $clientMsgId, $threadId = null) {
-    global $dbFile;
-    $db = json_decode(file_get_contents($dbFile), true);
-    $db[$staffMsgId] = [
-        "staff_message_id" => $staffMsgId,   // message_id в группе сотрудников (на него должны отвечать сотрудники)
-        "client_chat_id"   => $clientChatId, // id чата клиента
-        "client_message_id"=> $clientMsgId,  // исходный message_id клиента (на него бот будет отвечать при отправке сотруднику)
-        "thread_id"        => $threadId      // thread, чтобы держать всё в одной теме
-    ];
-    file_put_contents($dbFile, json_encode($db, JSON_PRETTY_PRINT));
-}
-
-function getMapping($staffMsgId) {
-    global $dbFile;
-    $db = json_decode(file_get_contents($dbFile), true);
-    return $db[$staffMsgId] ?? null;
-}
-
-function getMappingByClient($clientMsgId) {
-    global $dbFile;
-    $db = json_decode(file_get_contents($dbFile), true);
-    foreach ($db as $map) {
-        if ($map["client_message_id"] == $clientMsgId) {
-            return $map;
-        }
+    // Создаем топик с названием группы клиента
+    $topicName = "📂 " . $groupTitle;
+    $res = tgRequest("createForumTopic", ["chat_id" => $staffGroupId, "name" => $topicName]);
+    
+    if (isset($res["result"]["message_thread_id"])) {
+        $threadId = $res["result"]["message_thread_id"];
+        $topics["c_$chatId"] = $threadId;      // Чат клиента -> Топик
+        $topics["t_$threadId"] = $chatId;      // Топик -> Чат клиента
+        file_put_contents($topicsFile, json_encode($topics, JSON_PRETTY_PRINT));
+        return $threadId;
     }
     return null;
 }
 
+function getClientIdByThread($threadId) {
+    global $topicsFile;
+    $topics = json_decode(file_get_contents($topicsFile), true);
+    return $topics["t_$threadId"] ?? null;
+}
+
 // ====== ПОЛУЧЕНИЕ ОБНОВЛЕНИЯ ======
 $update = json_decode(file_get_contents("php://input"), true);
-file_put_contents(__DIR__."/log.txt", date("Y-m-d H:i:s")." Update: ".print_r($update, true)."\n", FILE_APPEND);
-
-if (!$update || !isset($update["message"])) { echo "OK"; exit; }
+if (!$update || !isset($update["message"])) exit;
 
 $msg = $update["message"];
 $chatId = $msg["chat"]["id"];
 $msgId  = $msg["message_id"];
 $userId = $msg["from"]["id"];
-$userName = trim(($msg["from"]["first_name"] ?? "") . " " . ($msg["from"]["last_name"] ?? ""));
+
+// Определяем имя группы (или "Личное", если это ЛС)
+$groupTitle = $msg["chat"]["title"] ?? "Личное (".$msg["from"]["first_name"].")";
+
+// Определяем имя конкретного человека
+$firstName = $msg["from"]["first_name"] ?? "";
+$lastName = $msg["from"]["last_name"] ?? "";
+$senderName = trim($firstName . " " . $lastName);
+if (empty($senderName)) $senderName = "User_$userId";
 
 // ====================
-// ОТВЕТ СОТРУДНИКА (в группе → клиенту)
+// ВХОДЯЩЕЕ ОТ СОТРУДНИКА (Группа сотрудников -> Клиентская группа)
 // ====================
-if ($chatId === $staffGroupId && isset($msg["reply_to_message"])) {
-    // доступ только для разрешённых сотрудников
-    if (!in_array($userId, $allowedStaff)) { echo "OK"; exit; }
+if ($chatId == $staffGroupId) {
+    if (!in_array($userId, $allowedStaff)) exit;
 
-    // сотрудники ДОЛЖНЫ отвечать именно на скопированное сообщение клиента (то, что бот сохранил)
-    $staffMsgId = $msg["reply_to_message"]["message_id"];
-    $mapping = getMapping($staffMsgId);
-    if (!$mapping) { echo "OK"; exit; }
+    $targetClientId = null;
+    $replyToMsgId = null;
+    $currentThreadId = $msg["message_thread_id"] ?? null;
 
-    // отправляем текст сотрудника клиенту как reply на исходный message клиента
-    if (isset($msg["text"])) {
-        $header = "👨‍💼 От сотрудника: $userName\n\n";
-        $params = [
-            "chat_id" => $mapping["client_chat_id"],
-            "text" => $header.$msg["text"],
-            "reply_to_message_id" => $mapping["client_message_id"]
-        ];
-        $sent = tgRequest("sendMessage", $params);
-        if (!$sent || (isset($sent["ok"]) && !$sent["ok"])) {
-            file_put_contents(__DIR__."/log.txt", date("Y-m-d H:i:s")." sendMessage to client error: ".json_encode($sent)."\n", FILE_APPEND);
+    if (isset($msg["reply_to_message"])) {
+        $db = json_decode(file_get_contents($dbFile), true);
+        $map = $db[$msg["reply_to_message"]["message_id"]] ?? null;
+        if ($map) {
+            $targetClientId = $map["client_chat_id"];
+            $replyToMsgId = $map["client_message_id"];
         }
     }
+    
+    if (!$targetClientId && $currentThreadId) {
+        $targetClientId = getClientIdByThread($currentThreadId);
+    }
 
-    echo "OK";
+    if ($targetClientId) {
+        $method = "sendMessage";
+        $params = ["chat_id" => $targetClientId];
+        if ($replyToMsgId) $params["reply_to_message_id"] = $replyToMsgId;
+
+        if (isset($msg["text"])) {
+            $params["text"] = "👨‍💼 *Поддержка:*\n\n" . $msg["text"];
+            $params["parse_mode"] = "Markdown";
+        } elseif (isset($msg["photo"])) {
+            $method = "sendPhoto";
+            $params["photo"] = end($msg["photo"])["file_id"];
+            $params["caption"] = "👨‍💼 Ответ поддержки";
+        } elseif (isset($msg["video"])) {
+            $method = "sendVideo";
+            $params["video"] = $msg["video"]["file_id"];
+        } elseif (isset($msg["document"])) {
+            $method = "sendDocument";
+            $params["document"] = $msg["document"]["file_id"];
+        } elseif (isset($msg["voice"])) {
+            $method = "sendVoice";
+            $params["voice"] = $msg["voice"]["file_id"];
+        }
+
+        $result = tgRequest($method, $params);
+
+        if (!$result || (isset($result["ok"]) && !$result["ok"])) {
+            $error = $result["description"] ?? "Ошибка";
+            tgRequest("sendMessage", [
+                "chat_id" => $staffGroupId,
+                "message_thread_id" => $currentThreadId,
+                "text" => "⚠️ *Не доставлено:* $error",
+                "parse_mode" => "Markdown"
+            ]);
+        }
+    }
     exit;
 }
 
 // ====================
-// КЛИЕНТ ПИШЕТ (клиент → группу)
+// ВХОДЯЩЕЕ ОТ КЛИЕНТА (Группа клиента -> Группа сотрудников)
 // ====================
-$groupName = $msg["chat"]["title"] ?? "Личное";
-$threadId = getOrCreateTopic($staffGroupId, $groupName);
+$threadId = getThreadForClient($chatId, $groupTitle);
 
-// параметры копирования сообщения клиента в группу сотрудников (любой тип контента)
-$copyParams = [
-    "chat_id" => $staffGroupId,
-    "from_chat_id" => $chatId,
-    "message_id" => $msgId,
-    "message_thread_id" => $threadId
-];
+if ($threadId) {
+    $method = "sendMessage";
+    $params = [
+        "chat_id" => $staffGroupId,
+        "message_thread_id" => $threadId,
+        "parse_mode" => "Markdown"
+    ];
 
-// если клиент ответил на сообщение сотрудника — найдём, к какому staff‑message в группе привязать reply
-if (isset($msg["reply_to_message"])) {
-    $replyMapping = getMappingByClient($msg["reply_to_message"]["message_id"]);
-    if ($replyMapping) {
-        // reply должен указывать на ТО сообщение в группе, которое сотрудники видят и на которое будут отвечать
-        $copyParams["reply_to_message_id"] = $replyMapping["staff_message_id"];
-        // используем тот же thread, чтобы не было "message thread not found"
-        if (!empty($replyMapping["thread_id"])) {
-            $copyParams["message_thread_id"] = $replyMapping["thread_id"];
-        }
+    // Формируем заголовок: [Имя пользователя]
+    $prefix = "👤 *{$senderName}:*\n";
+
+    if (isset($msg["text"])) {
+        $params["text"] = $prefix . $msg["text"];
+    } elseif (isset($msg["photo"])) {
+        $method = "sendPhoto";
+        $params["photo"] = end($msg["photo"])["file_id"];
+        $params["caption"] = $prefix;
+    } elseif (isset($msg["video"])) {
+        $method = "sendVideo";
+        $params["video"] = $msg["video"]["file_id"];
+        $params["caption"] = $prefix;
+    } elseif (isset($msg["document"])) {
+        $method = "sendDocument";
+        $params["document"] = $msg["document"]["file_id"];
+        $params["caption"] = $prefix;
+    } else {
+        // Если тип сообщения сложный, просто копируем
+        $sent = tgRequest("copyMessage", [
+            "chat_id" => $staffGroupId,
+            "from_chat_id" => $chatId,
+            "message_id" => $msgId,
+            "message_thread_id" => $threadId
+        ]);
+        $resId = $sent["result"]["message_id"] ?? null;
+    }
+
+    if ($method !== "copyMessage" && !isset($resId)) {
+        $sent = tgRequest($method, $params);
+        $resId = $sent["result"]["message_id"] ?? null;
+    }
+
+    if ($resId) {
+        $db = json_decode(file_get_contents($dbFile), true);
+        $db[$resId] = [
+            "client_chat_id" => $chatId,
+            "client_message_id" => $msgId
+        ];
+        if (count($db) > 2000) $db = array_slice($db, -2000, null, true);
+        file_put_contents($dbFile, json_encode($db, JSON_PRETTY_PRINT));
     }
 }
-
-// копируем сообщение (любой тип) клиента в группу
-$sent = tgRequest("copyMessage", $copyParams);
-if (!$sent || (isset($sent["ok"]) && !$sent["ok"])) {
-    file_put_contents(__DIR__."/log.txt", date("Y-m-d H:i:s")." copyMessage error: ".json_encode($sent)."\n", FILE_APPEND);
-}
-
-// сохраняем маппинг: на ЭТО сообщение в группе должны отвечать сотрудники
-if (isset($sent["result"]["message_id"])) {
-    $savedThreadId = $copyParams["message_thread_id"] ?? null;
-    saveMapping($sent["result"]["message_id"], $chatId, $msgId, $savedThreadId);
-}
-
-echo "OK";
-exit;
-
-?>
